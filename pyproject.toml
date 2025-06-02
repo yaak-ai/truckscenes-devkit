@@ -4,4 +4,36 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "foxglove-schemas-protobuf>=0.2.2",
+    "loguru>=0.7.3",
+    "mcap-protobuf-support>=0.5.3",
+    "open3d>=0.19.0",
+    "opencv-python>=4.11.0.86",
+    "polars>=1.8.2",
+    "pyproj>=3.5.0",
+    "simplejpeg>=1.7.3",
+    "tqdm>=4.67.1",
+    "truckscenes-devkit",
+]
+
+[tool.uv.sources]
+truckscenes-devkit = { workspace = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src/truckscenes*"]
+exclude = ["idl*", "protos*"]
+
+[tool.rye]
+managed = true  # optional: if you're using Rye with uv
+
+[tool.ruff.lint]
+select = ["I", "W", "E"]
+
+[tool.test]
+dependencies = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
