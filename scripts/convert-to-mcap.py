@@ -8,8 +8,10 @@ from simplejpeg import encode_jpeg, decode_jpeg
 from pathlib import Path
 from argparse import ArgumentParser
 from loguru import logger
+import ffmpeg
 from truckscenes import TruckScenes
 from tqdm import tqdm
+from simplejpeg import decode_jpeg
 import polars as pl
 from foxglove_schemas_protobuf.CompressedImage_pb2 import CompressedImage
 from foxglove_schemas_protobuf.LocationFix_pb2 import LocationFix
@@ -21,7 +23,7 @@ from foxglove_schemas_protobuf.PackedElementField_pb2 import PackedElementField
 from google.protobuf.timestamp_pb2 import Timestamp
 from pyproj import Transformer
 from google.protobuf.wrappers_pb2 import FloatValue, Int32Value, BoolValue, StringValue
-
+from protos.python.intercom.proto.sensor_pb2 import ImageMetadata
 
 def quat_to_heading(quat):
     q_x, q_y, q_z, q_w = quat
@@ -225,132 +227,165 @@ def convert(rootdir, split, dest) -> None:
                     )
 
             # sensor data
-            sample_token = scene["first_sample_token"]
-            sample_bar = tqdm(range(scene["nbr_samples"]), ascii=True)
 
-            for _ in sample_bar:
-
+            for sensor in CAMERAS:
+                sample_token = scene["first_sample_token"]
                 sample = trucksc.get("sample", sample_token)
                 data = sample["data"]
-                timestamp = sample["timestamp"]
-                ts = Timestamp()
-                ts.FromMicroseconds(int(timestamp))
+                sample_bar = tqdm(range(scene["nbr_samples"]), ascii=True)
 
-                for sensor in CAMERAS:
+                # Camera + Lidar data
+                logger.info(f"Adding {sensor}")
+                # logger.info(f"Adding /sequence/lidar/{Lidar.VELODYNE.value}")
+                video_file = filename.parent.joinpath(f"{sensor}.mp4")
+
+                process = (
+                    ffmpeg
+                    .input('pipe:', format='rawvideo', pix_fmt='rgb24', s='1980x942', framerate=10.0)
+                    .output(
+                        video_file.as_posix(),
+                        vcodec='h264',
+                        pix_fmt='yuv420p',
+                        rc='vbr',
+                        bitrate='16M'
+                    )
+                    .overwrite_output()
+                    .run_async(pipe_stdin=True)
+                )
+
+                for sidx, sbar in enumerate(sample_bar):
+
+                    sample = trucksc.get("sample", sample_token)
+                    data = sample["data"]
+                    timestamp = sample["timestamp"]
+                    ts = Timestamp()
+                    ts.FromMicroseconds(int(timestamp))
+
                     sample_bar.set_description(f"{sensor:16s}:{sample_token}")
                     cam = trucksc.get("sample_data", data[sensor])
                     image_file = f"{trucksc.dataroot}/{cam['filename']}"
-                    with Path(image_file).open("rb") as file:
-                        bytes = file.read()
 
-                    img = CompressedImage(
-                        timestamp=ts,
-                        format="jpeg",
-                        data=bytes,
-                    )
+                    image = cv2.imread(image_file)
+                    image = image[:-1, :, (2, 1, 0)]
+                    process.stdin.write(image.tobytes())
 
-                    writer.write_message(
-                        topic=f"/sensor/{sensor}",
-                        log_time=ts.ToNanoseconds(),
-                        publish_time=ts.ToNanoseconds(),
-                        message=img,
-                    )
+                    sample_token = sample["next"]
+                    img_msg = ImageMetadata()
 
-                for sensor in RADARS:
-                    sample_bar.set_description(f"{sensor:16s}:{sample_token}")
-                    radar = trucksc.get("sample_data", data[sensor])
-                    pcd_file = f"{trucksc.dataroot}/{radar['filename']}"
-                    pcd = o3d.io.read_point_cloud(pcd_file)
-                    calib = calibrations[radar["calibrated_sensor_token"]]
-                    x, y, z = calib["translation"]
-                    position = Vector3(x=x, y=y, z=z)
-                    qw, qx, qy, qz = calib["rotation"]
-                    orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
-                    pose = Pose(position=position, orientation=orientation)
-
-                    # Define the fields of the point cloud
-                    fields = [
-                        PackedElementField(
-                            name="x", offset=0, type=PackedElementField.FLOAT32
-                        ),
-                        PackedElementField(
-                            name="y", offset=4, type=PackedElementField.FLOAT32
-                        ),
-                        PackedElementField(
-                            name="z", offset=8, type=PackedElementField.FLOAT32
-                        ),
-                    ]
-
-                    # Pack point data into binary format
-                    point_stride = 12  # Each point is 3 floats (x, y, z), 4 bytes each
-                    points = np.asarray(pcd.points, dtype=np.float32)
-
-                    # Construct the PointCloud message
-                    point_cloud_msg = PointCloud(
-                        timestamp=ts,
-                        frame_id="ego",
-                        pose=pose,
-                        point_stride=point_stride,
-                        fields=fields,
-                        data=points.tobytes(),
-                    )
+                    img_msg.camera_name = f"{sensor}"
+                    img_msg.encoding = "h264"
+                    img_msg.frame_idx = sidx
+                    img_msg.height = image.shape[0]
+                    img_msg.width = image.shape[1]
+                    img_msg.time_stamp = ts.ToDatetime()
 
                     writer.write_message(
-                        topic=f"/sensor/{sensor}",
+                        topic=f"/sequence/{sensor}",
                         log_time=ts.ToNanoseconds(),
+                        message=img_msg,
                         publish_time=ts.ToNanoseconds(),
-                        message=point_cloud_msg,
                     )
 
-                for sensor in LIDARS:
-                    sample_bar.set_description(f"{sensor:16s}:{sample_token}")
-                    radar = trucksc.get("sample_data", data[sensor])
-                    pcd_file = f"{trucksc.dataroot}/{radar['filename']}"
-                    pcd = o3d.io.read_point_cloud(pcd_file)
-                    calib = calibrations[radar["calibrated_sensor_token"]]
-                    x, y, z = calib["translation"]
-                    position = Vector3(x=x, y=y, z=z)
-                    qw, qx, qy, qz = calib["rotation"]
-                    orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
-                    pose = Pose(position=position, orientation=orientation)
+                process.stdin.close()
+                process.wait()
 
-                    # Define the fields of the point cloud
-                    fields = [
-                        PackedElementField(
-                            name="x", offset=0, type=PackedElementField.FLOAT32
-                        ),
-                        PackedElementField(
-                            name="y", offset=4, type=PackedElementField.FLOAT32
-                        ),
-                        PackedElementField(
-                            name="z", offset=8, type=PackedElementField.FLOAT32
-                        ),
-                    ]
+                logger.info(f"Done writing {video_file}")
+                # for sensor in RADARS:
+                #     sample_bar.set_description(f"{sensor:16s}:{sample_token}")
+                #     radar = trucksc.get("sample_data", data[sensor])
+                #     pcd_file = f"{trucksc.dataroot}/{radar['filename']}"
+                #     pcd = o3d.io.read_point_cloud(pcd_file)
+                #     calib = calibrations[radar["calibrated_sensor_token"]]
+                #     x, y, z = calib["translation"]
+                #     position = Vector3(x=x, y=y, z=z)
+                #     qw, qx, qy, qz = calib["rotation"]
+                #     orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+                #     pose = Pose(position=position, orientation=orientation)
 
-                    # Pack point data into binary format
-                    point_stride = 12  # Each point is 3 floats (x, y, z), 4 bytes each
-                    points = np.asarray(pcd.points, dtype=np.float32)
+                #     # Define the fields of the point cloud
+                #     fields = [
+                #         PackedElementField(
+                #             name="x", offset=0, type=PackedElementField.FLOAT32
+                #         ),
+                #         PackedElementField(
+                #             name="y", offset=4, type=PackedElementField.FLOAT32
+                #         ),
+                #         PackedElementField(
+                #             name="z", offset=8, type=PackedElementField.FLOAT32
+                #         ),
+                #     ]
 
-                    # Construct the PointCloud message
-                    point_cloud_msg = PointCloud(
-                        timestamp=ts,
-                        frame_id="ego",
-                        pose=pose,
-                        point_stride=point_stride,
-                        fields=fields,
-                        data=points.tobytes(),
-                    )
+                #     # Pack point data into binary format
+                #     point_stride = 12  # Each point is 3 floats (x, y, z), 4 bytes each
+                #     points = np.asarray(pcd.points, dtype=np.float32)
 
-                    writer.write_message(
-                        topic=f"/sensor/{sensor}",
-                        log_time=ts.ToNanoseconds(),
-                        publish_time=ts.ToNanoseconds(),
-                        message=point_cloud_msg,
-                    )
+                #     # Construct the PointCloud message
+                #     point_cloud_msg = PointCloud(
+                #         timestamp=ts,
+                #         frame_id="ego",
+                #         pose=pose,
+                #         point_stride=point_stride,
+                #         fields=fields,
+                #         data=points.tobytes(),
+                #     )
 
-                sample_token = sample["next"]
+                #     writer.write_message(
+                #         topic=f"/sensor/{sensor}",
+                #         log_time=ts.ToNanoseconds(),
+                #         publish_time=ts.ToNanoseconds(),
+                #         message=point_cloud_msg,
+                #     )
+
+                # for sensor in LIDARS:
+                #     sample_bar.set_description(f"{sensor:16s}:{sample_token}")
+                #     radar = trucksc.get("sample_data", data[sensor])
+                #     pcd_file = f"{trucksc.dataroot}/{radar['filename']}"
+                #     pcd = o3d.io.read_point_cloud(pcd_file)
+                #     calib = calibrations[radar["calibrated_sensor_token"]]
+                #     x, y, z = calib["translation"]
+                #     position = Vector3(x=x, y=y, z=z)
+                #     qw, qx, qy, qz = calib["rotation"]
+                #     orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+                #     pose = Pose(position=position, orientation=orientation)
+
+                #     # Define the fields of the point cloud
+                #     fields = [
+                #         PackedElementField(
+                #             name="x", offset=0, type=PackedElementField.FLOAT32
+                #         ),
+                #         PackedElementField(
+                #             name="y", offset=4, type=PackedElementField.FLOAT32
+                #         ),
+                #         PackedElementField(
+                #             name="z", offset=8, type=PackedElementField.FLOAT32
+                #         ),
+                #     ]
+
+                #     # Pack point data into binary format
+                #     point_stride = 12  # Each point is 3 floats (x, y, z), 4 bytes each
+                #     points = np.asarray(pcd.points, dtype=np.float32)
+
+                #     # Construct the PointCloud message
+                #     point_cloud_msg = PointCloud(
+                #         timestamp=ts,
+                #         frame_id="ego",
+                #         pose=pose,
+                #         point_stride=point_stride,
+                #         fields=fields,
+                #         data=points.tobytes(),
+                #     )
+
+                #     writer.write_message(
+                #         topic=f"/sensor/{sensor}",
+                #         log_time=ts.ToNanoseconds(),
+                #         publish_time=ts.ToNanoseconds(),
+                #         message=point_cloud_msg,
+                #     )
+
+                # sample_token = sample["next"]
 
             writer.finish()
+            logger.info(f"Done writing {filename}")
 
 
 if __name__ == "__main__":
