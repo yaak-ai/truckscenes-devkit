@@ -352,3 +352,4 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python,c++,visualstudiocode,pycharm,jupyternotebooks
 images
 scripts/test.sh
+protos/python/*
